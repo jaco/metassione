@@ -61,11 +61,18 @@ class ClassDefinitionBuilder implements ClassDefinitionBuilderInterface
 		//
 		// all other definitions are invalid
 
-		$pattern = '#@var\\s+(.+?)\\s*\\n#m';
+		// PHP 8 compatibility: ensure $phpdoc is a string
+		if ($phpdoc === false) {
+			$phpdoc = '';
+		}
+
+		// PHP 8 compatibility: PHPDoc can be single-line /** @var type */ without newline
+		// Match only the type specification, not additional description text
+		$pattern = '#@var\\s+(\\S+)#';
 		if (preg_match($pattern, $phpdoc, $m)) {
 			$phpdocTypeSpecification = $m[1];
 		} else {
-			$phpdocTypeSpecification = null;
+			$phpdocTypeSpecification = '';
 		}
 
 
@@ -216,19 +223,66 @@ class ClassDefinitionBuilder implements ClassDefinitionBuilderInterface
 	private function buildClassnameForType($classname, ReflectionProperty $reflectionProperty)
 	{
 		$classname = ltrim($classname, '\\'); // classnames are written as: "\Foo\Bar" not "Foo\Bar"
+
+		// If already starts with backslash or contains namespace separator, treat as FQCN
+		if (strpos($classname, '\\') !== false) {
+			$classname = ltrim($classname, '\\');
+			if (class_exists($classname, true)) {
+				return $classname;
+			}
+			throw new LogicException(sprintf('Class %s not found for property %s::%s', $classname, $reflectionProperty->getDeclaringClass()->getName(), $reflectionProperty->getName()));
+		}
+
 		if (class_exists($classname, true)) {
 			// Fully qualified classname
 			// or classname without namespace
 			return $classname;
 		}
 
-		$fullyQualifiedClassName = $reflectionProperty->getDeclaringClass()->getNamespaceName() . '\\' . $classname;
+		// Try to resolve using 'use' statements from the source file
+		$declaringClass = $reflectionProperty->getDeclaringClass();
+		$useStatements = $this->parseUseStatements($declaringClass);
+
+		if (isset($useStatements[$classname])) {
+			return $useStatements[$classname];
+		}
+
+		// Fallback: try current namespace
+		$fullyQualifiedClassName = $declaringClass->getNamespaceName() . '\\' . $classname;
 
 		if (class_exists($fullyQualifiedClassName, true)) {
 			return $fullyQualifiedClassName;
 		} else {
 			throw new LogicException(sprintf('Class %s (%s) not found for property %s::%s', $classname, $fullyQualifiedClassName, $reflectionProperty->getDeclaringClass()->getName(), $reflectionProperty->getName()));
 		}
+	}
+
+	/**
+	 * Parse use statements from class file
+	 * @param ReflectionClass $reflectionClass
+	 * @return array Map of short class name to fully qualified class name
+	 */
+	private function parseUseStatements(ReflectionClass $reflectionClass)
+	{
+		$fileName = $reflectionClass->getFileName();
+		if (!$fileName || !file_exists($fileName)) {
+			return [];
+		}
+
+		$content = file_get_contents($fileName);
+		$useStatements = [];
+
+		// Match: use Foo\Bar\ClassName;
+		// Match: use Foo\Bar\ClassName as Alias;
+		if (preg_match_all('/^use\s+([a-zA-Z0-9_\\\\]+)(?:\s+as\s+([a-zA-Z0-9_]+))?\s*;/m', $content, $matches, PREG_SET_ORDER)) {
+			foreach ($matches as $match) {
+				$fullClassName = $match[1];
+				$alias = isset($match[2]) && $match[2] ? $match[2] : basename(str_replace('\\', '/', $fullClassName));
+				$useStatements[$alias] = ltrim($fullClassName, '\\');
+			}
+		}
+
+		return $useStatements;
 	}
 
 	/**
